@@ -9,5 +9,5 @@ repository = "https://github.com/yolialisproxy/SingboxGUI-rust"
 [dependencies]
 eframe = "0.28"
 egui = "0.28"
-systray = { version = "0.5", optional = true }
+# systray = { version = "0.5", optional = true } # Disabled until offline build issue resolved
 # We'll use conditional compilation for tray
