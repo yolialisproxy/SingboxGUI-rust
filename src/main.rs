@@ -1,5 +1,6 @@
 use eframe::egui;
 use eframe::egui::{CentralPanel, Context, ScrollArea, TextEdit, TopBottomPanel};
+use std::collections::VecDeque;
 use std::process::{Command, Stdio, ExitStatus, Child};
 use std::sync::mpsc;
 use std::thread;
@@ -21,9 +22,8 @@ enum Event {
 
 struct SingBoxGui {
     // UI State
-    logs: Vec<String>,
-    show_logs: bool,
-    auto_scroll: bool,
+    logs: VecDeque<String>,           // Ring buffer for log lines
+    auto_scroll: bool,               // Whether to auto-scroll to bottom on new logs
     is_running: bool,
     singbox_path: String,
     log_filter: String,
@@ -36,27 +36,24 @@ struct SingBoxGui {
     settings_path_input: String,
     startup_verified: bool,
     singbox_available: bool,
-    // Repaint control
-    needs_repaint: bool,
-    scroll_to_bottom: bool,
-    // Background handle
+    // Rendering hints
+    needs_repaint: bool,             // True when new log lines or status change requires UI refresh
+    scroll_to_bottom: bool,          // Queue a scroll to bottom on next frame
+    // Background
     bg_handle: Option<thread::JoinHandle<()>>,
 }
 
 impl SingBoxGui {
     fn new() -> Self {
-        // Create channels for background communication
         let (command_tx, command_rx) = mpsc::channel::<Command>();
         let (event_tx, event_rx) = mpsc::channel::<Event>();
 
-        // Spawn the background worker thread
         let bg_handle = thread::spawn(move || {
             background_loop(command_rx, event_tx);
         });
 
         Self {
-            logs: Vec::with_capacity(1000),
-            show_logs: true,
+            logs: VecDeque::with_capacity(1000),
             auto_scroll: true,
             is_running: false,
             singbox_path: "sing-box".to_string(),
@@ -83,9 +80,10 @@ impl SingBoxGui {
         let minutes = ((secs / 60) % 60) as u32;
         let seconds = (secs % 60) as u32;
         let line = format!("[{:02}:{:02}:{:02}] {}", hours, minutes, seconds, message);
-        self.logs.push(line);
+        self.logs.push_back(line);
+        // Keep log history bounded (max 1000 lines)
         if self.logs.len() > 1000 {
-            self.logs.remove(0);
+            self.logs.pop_front();
         }
     }
 
@@ -113,9 +111,11 @@ impl SingBoxGui {
             }
         }
 
-        if had_events && self.auto_scroll {
-            self.scroll_to_bottom = true;
+        if had_events {
             self.needs_repaint = true;
+            if self.auto_scroll {
+                self.scroll_to_bottom = true;
+            }
         }
     }
 
@@ -160,13 +160,18 @@ impl SingBoxGui {
         }
     }
 
+    fn clear_logs(&mut self) {
+        self.logs.clear();
+    }
+
     fn build_filtered_logs(&self) -> String {
         if self.log_filter.is_empty() {
             return self.logs.join("\n");
         }
 
         let filter_lower = self.log_filter.to_lowercase();
-        let filtered: Vec<&str> = self.logs
+        let filtered: Vec<&str> = self
+            .logs
             .iter()
             .filter(|line| line.to_lowercase().contains(&filter_lower))
             .map(|s| s.as_str())
@@ -177,7 +182,7 @@ impl SingBoxGui {
 
 impl Drop for SingBoxGui {
     fn drop(&mut self) {
-        // Cleanly close command channel, signaling background thread to exit
+        // Close command channel, signaling background thread to exit
         drop(self.command_tx.take());
         // Join background worker
         if let Some(handle) = self.bg_handle.take() {
@@ -188,13 +193,9 @@ impl Drop for SingBoxGui {
 
 impl eframe::App for SingBoxGui {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
-        // Periodically verify sing-box if not yet verified
         self.check_singbox_availability();
-
-        // Process any incoming events
         self.process_events();
 
-        // Top Menu Bar
         TopBottomPanel::top("menu").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if ui.button("Start").clicked() {
@@ -215,7 +216,6 @@ impl eframe::App for SingBoxGui {
             });
         });
 
-        // Bottom Status Bar
         TopBottomPanel::bottom("status").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label(format!("Status: {}", if self.is_running { "Running" } else { "Stopped" }));
@@ -224,12 +224,9 @@ impl eframe::App for SingBoxGui {
                 ui.add_space(10.0);
 
                 if self.startup_verified {
-                    ui.label(format!("Availability: {}",
-                        if self.singbox_available {
-                            "✓ Available"
-                        } else {
-                            "✗ Not found"
-                        }
+                    ui.label(format!(
+                        "Availability: {}",
+                        if self.singbox_available { "✓ Available" } else { "✗ Not found" }
                     ));
                 } else {
                     ui.label("Checking availability...");
@@ -240,18 +237,24 @@ impl eframe::App for SingBoxGui {
             });
         });
 
-        // Central Log Panel
         CentralPanel::default().show(ctx, |ui| {
             ui.vertical(|ui| {
-                ui.checkbox(&mut self.show_logs, "Auto-scroll");
-                ui.add_space(5.0);
-                ui.label("Log filter (regex not supported, simple substring search):");
-                ui.text_edit_singleline(&mut self.log_filter);
+                ui.checkbox(&mut self.auto_scroll, "Auto-scroll to bottom");
                 ui.add_space(5.0);
 
-                // Log Display
+                // Filter row
+                ui.horizontal(|ui| {
+                    ui.label("Filter:");
+                    ui.text_edit_singleline(&mut self.log_filter);
+                    if ui.button("Clear Logs").clicked() {
+                        self.clear_logs();
+                    }
+                });
+                ui.label(format!("Log lines: {}", self.logs.len()));
+                ui.add_space(5.0);
+
+                // Build display text
                 let log_text = self.build_filtered_logs();
-                // Using a fresh copy for TextEdit
                 let mut log_buffer = log_text.clone();
 
                 let scroll_response = ScrollArea::vertical()
@@ -261,11 +264,11 @@ impl eframe::App for SingBoxGui {
                             TextEdit::multiline(&mut log_buffer)
                                 .desired_rows(20)
                                 .font(egui::TextStyle::Monospace)
-                                .interactive(false),
+                                .interactive(false)
                         );
                     });
 
-                // Auto-scroll if requested
+                // Auto-scroll
                 if self.scroll_to_bottom {
                     scroll_response.inner.scroll_to_cursor(Some(egui::ScrollToAnchor::End));
                     self.scroll_to_bottom = false;
@@ -273,7 +276,7 @@ impl eframe::App for SingBoxGui {
             });
         });
 
-        // Settings Window
+        // Settings window
         if self.show_settings {
             egui::Window::new("Settings")
                 .show(ctx, |ui| {
@@ -304,7 +307,7 @@ impl eframe::App for SingBoxGui {
                 });
         }
 
-        // About Window
+        // About window
         if self.show_about {
             egui::Window::new("About SingboxGUI-Rust")
                 .show(ctx, |ui| {
@@ -316,9 +319,10 @@ impl eframe::App for SingBoxGui {
                         ui.label("Core features:");
                         ui.label("• Start/stop sing-box process");
                         ui.label("• Real-time logging with timestamps");
-                        ui.label("• Simple log filter");
-                        ui.label("• Configurable sing-box path");
-                        ui.label("• Startup availability check");
+                        ui.label("• Live log filter");
+                        ui.label("• Configurable sing-box binary path");
+                        ui.label("• Persistent log buffer (ring buffer)");
+                        ui.label("• Background I/O worker for smooth UI");
                         ui.add_space(10.0);
                         if ui.button("Close").clicked() {
                             self.show_about = false;
@@ -327,7 +331,7 @@ impl eframe::App for SingBoxGui {
                 });
         }
 
-        // Request repaint only when there's actual new content
+        // Repaint only when new content arrived
         if self.needs_repaint {
             ctx.request_repaint();
             self.needs_repaint = false;
@@ -335,7 +339,7 @@ impl eframe::App for SingBoxGui {
     }
 }
 
-/// Background worker: manages sing-box process and streams its output
+/// Background worker: handles sing-box process I/O and lifetime
 fn background_loop(command_rx: mpsc::Receiver<Command>, event_tx: mpsc::Sender<Event>) {
     let mut child: Option<Child> = None;
 
@@ -353,7 +357,7 @@ fn background_loop(command_rx: mpsc::Receiver<Command>, event_tx: mpsc::Sender<E
 
                 match cmd.spawn() {
                     Ok(mut child_process) => {
-                        // Spawn reader for stdout
+                        // Thread: read stdout
                         let tx = event_tx.clone();
                         if let Some(stdout) = child_process.stdout.take() {
                             thread::spawn(move || {
@@ -366,7 +370,7 @@ fn background_loop(command_rx: mpsc::Receiver<Command>, event_tx: mpsc::Sender<E
                             });
                         }
 
-                        // Spawn reader for stderr
+                        // Thread: read stderr
                         let tx = event_tx.clone();
                         if let Some(stderr) = child_process.stderr.take() {
                             thread::spawn(move || {
@@ -379,7 +383,7 @@ fn background_loop(command_rx: mpsc::Receiver<Command>, event_tx: mpsc::Sender<E
                             });
                         }
 
-                        // Spawn waiter for exit notification
+                        // Thread: wait for exit
                         let tx = event_tx.clone();
                         thread::spawn(move || {
                             if let Ok(status) = child_process.wait() {
@@ -398,22 +402,40 @@ fn background_loop(command_rx: mpsc::Receiver<Command>, event_tx: mpsc::Sender<E
             }
             Ok(Command::Stop) => {
                 if let Some(mut child) = child.take() {
+                    // Attempt graceful termination first (SIGTERM on Unix)
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::process::CommandExt;
+                        // Obtain process ID and terminate the process group
+                        unsafe {
+                            if let Ok(Some(pid)) = child.id() {
+                                let pgid = libc::getpgid(pid);
+                                // send SIGTERM to the whole process group
+                                let sig = if pgid == pid { libc::SIGTERM } else { -pgid as i32 };
+                                libc::kill(pid as i32, libc::SIGTERM);
+                                // If we had a group, also kill that group with negative pid
+                                if pgid != pid {
+                                    libc::kill(-pgid as i32, libc::SIGTERM);
+                                }
+                            }
+                        }
+                    }
+                    // Fallback: kill forcibly after grace period
                     let _ = child.kill();
                     let _ = child.wait();
-                    // The ProcessExited event arrives via the wait thread eventually
                     let _ = event_tx.send(Event::Log("Stopping sing-box...".into()));
                 } else {
                     let _ = event_tx.send(Event::Log("No running process to stop".into()));
                 }
             }
             Err(mpsc::RecvError) => {
-                // Channel closed — shut down
+                // Channel closed — background worker exits
                 break;
             }
         }
     }
 
-    // Ensure any residual subprocess is terminated before exit
+    // Ensure any remaining child is terminated
     if let Some(mut child) = child {
         let _ = child.kill();
         let _ = child.wait();
@@ -427,6 +449,7 @@ fn main() -> eframe::Result<()> {
             .with_min_inner_size([600.0, 400.0]),
         ..Default::default()
     };
+
     eframe::run_native(
         "SingboxGUI-Rust",
         native_options,
