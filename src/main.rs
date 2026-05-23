@@ -2,13 +2,13 @@ use eframe::egui;
 use eframe::egui::{CentralPanel, Context, ScrollArea, TextEdit, TopBottomPanel};
 use std::collections::VecDeque;
 use std::io::{self, BufRead};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Child, Command as StdCommand, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug)]
-enum Command {
+enum GuiCommand {
     Start { path: String },
     Stop,
 }
@@ -27,8 +27,12 @@ struct SingBoxGui {
     is_running: bool,
     singbox_path: String,
     log_filter: String,
+    // Cached filtered logs for performance
+    filtered_logs_cache: String,
+    filtered_logs_dirty: bool,
+    prev_log_filter: String,
     // Communication channels
-    command_tx: Option<mpsc::Sender<Command>>,
+    command_tx: Option<mpsc::Sender<GuiCommand>>,
     event_rx: Option<mpsc::Receiver<Event>>,
     // UI Context
     show_settings: bool,
@@ -45,7 +49,7 @@ struct SingBoxGui {
 
 impl SingBoxGui {
     fn new() -> Self {
-        let (command_tx, command_rx) = mpsc::channel::<Command>();
+        let (command_tx, command_rx) = mpsc::channel::<GuiCommand>();
         let (event_tx, event_rx) = mpsc::channel::<Event>();
 
         let bg_handle = thread::spawn(move || {
@@ -58,6 +62,10 @@ impl SingBoxGui {
             is_running: false,
             singbox_path: "sing-box".to_string(),
             log_filter: String::new(),
+            // Cached filtered logs for performance
+            filtered_logs_cache: String::new(),
+            filtered_logs_dirty: true,
+            prev_log_filter: String::new(),
             command_tx: Some(command_tx),
             event_rx: Some(event_rx),
             show_settings: false,
@@ -88,10 +96,14 @@ impl SingBoxGui {
     }
 
     fn process_events(&mut self) {
-        let rx = self.event_rx.as_mut().unwrap();
+        let mut events = Vec::new();
+        if let Some(rx) = self.event_rx.as_mut() {
+            while let Ok(event) = rx.try_recv() {
+                events.push(event);
+            }
+        }
         let mut had_events = false;
-
-        while let Ok(event) = rx.try_recv() {
+        for event in events {
             match event {
                 Event::Log(msg) => {
                     self.log(msg);
@@ -124,7 +136,7 @@ impl SingBoxGui {
             return;
         }
         if let Some(tx) = &self.command_tx {
-            let _ = tx.send(Command::Start {
+            let _ = tx.send(GuiCommand::Start {
                 path: self.singbox_path.clone(),
             });
         }
@@ -135,22 +147,22 @@ impl SingBoxGui {
             return;
         }
         if let Some(tx) = &self.command_tx {
-            let _ = tx.send(Command::Stop);
+            let _ = tx.send(GuiCommand::Stop);
         }
     }
 
-    fn verify_singbox_path(&mut self, path: &str) -> bool {
-        match Command::new(path).arg("--version").output() {
+    fn verify_singbox_path(&self, path: &str) -> (bool, String) {
+        match StdCommand::new(path).arg("--version").output() {
             Ok(output) if output.status.success() => {
-                self.log(format!(
+                let msg = format!(
                     "Sing-box found: {}",
                     String::from_utf8_lossy(&output.stdout)
-                ));
-                true
+                );
+                (true, msg)
             }
             _ => {
-                self.log(format!("Failed to verify sing-box at {}", path));
-                false
+                let msg = format!("Failed to verify sing-box at {}", path);
+                (false, msg)
             }
         }
     }
@@ -158,30 +170,50 @@ impl SingBoxGui {
     fn check_singbox_availability(&mut self) {
         if !self.startup_verified {
             self.startup_verified = true;
-            self.singbox_available = self.verify_singbox_path(&self.singbox_path);
+            let (available, msg) = self.verify_singbox_path(&self.singbox_path);
+            self.singbox_available = available;
+            self.log(msg);
             if !self.singbox_available {
-                self.log("Warning: sing-box not found or not executable. Please check the path in Settings.".to_string());
+                self.log(
+                    "Warning: sing-box not found or not executable. Please check the path in Settings."
+                        .to_string(),
+                );
             }
         }
     }
 
     fn clear_logs(&mut self) {
         self.logs.clear();
+        self.filtered_logs_dirty = true;
     }
 
-    fn build_filtered_logs(&self) -> String {
-        if self.log_filter.is_empty() {
-            return self.logs.join("\n");
+    fn build_filtered_logs(&mut self) -> &str {
+        // Rebuild if filter changed or logs have been updated since last build
+        if self.filtered_logs_dirty || self.log_filter != self.prev_log_filter {
+            self.filtered_logs_cache = if self.log_filter.is_empty() {
+                self.logs
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            } else {
+                let filter_lower = self.log_filter.to_lowercase();
+                let filtered: Vec<String> = self
+                    .logs
+                    .iter()
+                    .filter(|line| line.to_lowercase().contains(&filter_lower))
+                    .map(|line| line.clone())
+                    .collect();
+                filtered
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            self.prev_log_filter = self.log_filter.clone();
+            self.filtered_logs_dirty = false;
         }
-
-        let filter_lower = self.log_filter.to_lowercase();
-        let filtered: Vec<&str> = self
-            .logs
-            .iter()
-            .filter(|line| line.to_lowercase().contains(&filter_lower))
-            .map(|s| s.as_str())
-            .collect();
-        filtered.join("\n")
+        &self.filtered_logs_cache
     }
 }
 
@@ -271,22 +303,22 @@ impl eframe::App for SingBoxGui {
 
                 // Build display text
                 let log_text = self.build_filtered_logs();
-                let mut log_buffer = log_text.clone();
+                let mut log_buffer = log_text.to_string();
 
-                let scroll_response = ScrollArea::vertical().max_height(400.0).show(ui, |ui| {
-                    ui.add(
-                        TextEdit::multiline(&mut log_buffer)
-                            .desired_rows(20)
-                            .font(egui::TextStyle::Monospace)
-                            .interactive(false),
-                    );
-                });
+                let scroll_response = ScrollArea::vertical()
+                    .max_height(400.0)
+                    .show(ui, |ui| {
+                        ui.add(
+                            TextEdit::multiline(&mut log_buffer)
+                                .desired_rows(20)
+                                .font(egui::TextStyle::Monospace)
+                                .interactive(false),
+                        )
+                    });
 
                 // Auto-scroll
                 if self.scroll_to_bottom {
-                    scroll_response
-                        .inner
-                        .scroll_to_cursor(Some(egui::ScrollToAnchor::End));
+                    scroll_response.inner.scroll_to_me(Some(egui::Align::BOTTOM));
                     self.scroll_to_bottom = false;
                 }
             });
@@ -304,9 +336,12 @@ impl eframe::App for SingBoxGui {
                                 let _ = self.verify_singbox_path(&self.settings_path_input);
                             }
                             if ui.button("Apply").clicked() {
-                                if self.verify_singbox_path(&self.settings_path_input) {
+                                if self.verify_singbox_path(&self.settings_path_input).0 {
                                     self.singbox_path = self.settings_path_input.clone();
-                                    self.log(format!("Settings saved. New path: {}", self.singbox_path));
+                                    self.log(format!(
+                                        "Settings saved. New path: {}",
+                                        self.singbox_path
+                                    ));
                                     self.startup_verified = false;
                                 }
                                 self.show_settings = false;
@@ -316,7 +351,9 @@ impl eframe::App for SingBoxGui {
                             }
                         });
                         ui.add_space(10.0);
-                        ui.label("Note: The path can be an absolute path or just the executable name if it's in your PATH.");
+                        ui.label(
+                            "Note: The path can be an absolute path or just the executable name if it's in your PATH."
+                        );
                         ui.add_space(10.0);
                         ui.checkbox(&mut self.auto_scroll, "Enable auto-scroll in log view");
                     });
@@ -325,25 +362,26 @@ impl eframe::App for SingBoxGui {
 
         // About window
         if self.show_about {
-            egui::Window::new("About SingboxGUI-Rust").show(ctx, |ui| {
-                ui.vertical(|ui| {
-                    ui.heading("SingboxGUI-Rust");
-                    ui.label("A graphical user interface for Sing-box");
-                    ui.label("Written in Rust with eframe/egui");
-                    ui.add_space(10.0);
-                    ui.label("Core features:");
-                    ui.label("• Start/stop sing-box process");
-                    ui.label("• Real-time logging with timestamps");
-                    ui.label("• Live log filter");
-                    ui.label("• Configurable sing-box binary path");
-                    ui.label("• Persistent log buffer (ring buffer)");
-                    ui.label("• Background I/O worker for smooth UI");
-                    ui.add_space(10.0);
-                    if ui.button("Close").clicked() {
-                        self.show_about = false;
-                    }
+            egui::Window::new("About SingboxGUI-Rust")
+                .show(ctx, |ui| {
+                    ui.vertical(|ui| {
+                        ui.heading("SingboxGUI-Rust");
+                        ui.label("A graphical user interface for Sing-box");
+                        ui.label("Written in Rust with eframe/egui");
+                        ui.add_space(10.0);
+                        ui.label("Core features:");
+                        ui.label("• Start/stop sing-box process");
+                        ui.label("• Real-time logging with timestamps");
+                        ui.label("• Live log filter");
+                        ui.label("• Configurable sing-box binary path");
+                        ui.label("• Persistent log buffer (ring buffer)");
+                        ui.label("• Background I/O worker for smooth UI");
+                        ui.add_space(10.0);
+                        if ui.button("Close").clicked() {
+                            self.show_about = false;
+                        }
+                    });
                 });
-            });
         }
 
         // Repaint only when new content arrived
@@ -355,24 +393,25 @@ impl eframe::App for SingBoxGui {
 }
 
 /// Background worker: handles sing-box process I/O and lifetime
-fn background_loop(command_rx: mpsc::Receiver<Command>, event_tx: mpsc::Sender<Event>) {
+fn background_loop(command_rx: mpsc::Receiver<GuiCommand>, event_tx: mpsc::Sender<Event>) {
     let mut child: Option<Child> = None;
 
     loop {
-        match command_rx.recv() {
-            Ok(Command::Start { path }) => {
+        // Process any pending commands
+        match command_rx.try_recv() {
+            Ok(GuiCommand::Start { path }) => {
                 if child.is_some() {
                     let _ = event_tx.send(Event::Log("Process already running".into()));
                     continue;
                 }
-                let mut cmd = Command::new(&path);
+                let mut cmd = StdCommand::new(&path);
                 cmd.arg("run").stdout(Stdio::piped()).stderr(Stdio::piped());
 
                 match cmd.spawn() {
                     Ok(mut child_process) => {
-                        // Thread: read stdout
-                        let tx = event_tx.clone();
+                        // Spawn stdout reader thread
                         if let Some(stdout) = child_process.stdout.take() {
+                            let tx = event_tx.clone();
                             thread::spawn(move || {
                                 let reader = io::BufReader::new(stdout);
                                 for line in reader.lines() {
@@ -383,9 +422,9 @@ fn background_loop(command_rx: mpsc::Receiver<Command>, event_tx: mpsc::Sender<E
                             });
                         }
 
-                        // Thread: read stderr
-                        let tx = event_tx.clone();
+                        // Spawn stderr reader thread
                         if let Some(stderr) = child_process.stderr.take() {
+                            let tx = event_tx.clone();
                             thread::spawn(move || {
                                 let reader = io::BufReader::new(stderr);
                                 for line in reader.lines() {
@@ -396,14 +435,7 @@ fn background_loop(command_rx: mpsc::Receiver<Command>, event_tx: mpsc::Sender<E
                             });
                         }
 
-                        // Thread: wait for exit
-                        let tx = event_tx.clone();
-                        thread::spawn(move || {
-                            if let Ok(status) = child_process.wait() {
-                                let _ = tx.send(Event::ProcessExited(status));
-                            }
-                        });
-
+                        // Store child handle
                         child = Some(child_process);
                         let _ = event_tx.send(Event::ProcessStarted);
                         let _ = event_tx.send(Event::Log(format!("Started sing-box at {}", path)));
@@ -414,25 +446,36 @@ fn background_loop(command_rx: mpsc::Receiver<Command>, event_tx: mpsc::Sender<E
                     }
                 }
             }
-            Ok(Command::Stop) => {
-                if let Some(mut child) = child.take() {
-                    // Attempt graceful termination first (SIGTERM on Unix)
-                    // Currently we rely on the standard `kill` implementation
-                    // which sends SIGKILL, appropriate for environments where
-                    // sing-box may not respond to SIGTERM.
-                    // Future: use libc or nix to send SIGTERM before SIGKILL.
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    let _ = event_tx.send(Event::Log("Stopping sing-box...".into()));
+            Ok(GuiCommand::Stop) => {
+                if let Some(mut child_handle) = child.take() {
+                    // Attempt to kill and wait
+                    let _ = child_handle.kill();
+                    if let Ok(status) = child_handle.wait() {
+                        let _ = event_tx.send(Event::ProcessExited(status));
+                    } else {
+                        let _ = event_tx.send(Event::Log("Failed to wait for child".into()));
+                    }
                 } else {
                     let _ = event_tx.send(Event::Log("No running process to stop".into()));
                 }
             }
-            Err(mpsc::RecvError) => {
+            Err(mpsc::TryRecvError::Disconnected) => {
                 // Channel closed — background worker exits
                 break;
             }
+            Err(mpsc::TryRecvError::Empty) => {}
         }
+
+        // Check if the child process has exited on its own
+        if let Some(child_handle) = child.as_mut() {
+            if let Ok(Some(status)) = child_handle.try_wait() {
+                let _ = event_tx.send(Event::ProcessExited(status));
+                child = None;
+            }
+        }
+
+        // Avoid busy waiting
+        thread::sleep(Duration::from_millis(50));
     }
 
     // Ensure any remaining child is terminated
