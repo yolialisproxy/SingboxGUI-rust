@@ -202,7 +202,7 @@ impl SingBoxGui {
                     .logs
                     .iter()
                     .filter(|line| line.to_lowercase().contains(&filter_lower))
-                    .map(|line| line.clone())
+                    .cloned()
                     .collect();
                 filtered
                     .iter()
@@ -414,10 +414,8 @@ fn background_loop(command_rx: mpsc::Receiver<GuiCommand>, event_tx: mpsc::Sende
                             let tx = event_tx.clone();
                             thread::spawn(move || {
                                 let reader = io::BufReader::new(stdout);
-                                for line in reader.lines() {
-                                    if let Ok(line) = line {
-                                        let _ = tx.send(Event::Log(line));
-                                    }
+                                for line in reader.lines().map_while(Result::ok) {
+                                    let _ = tx.send(Event::Log(line));
                                 }
                             });
                         }
@@ -427,10 +425,8 @@ fn background_loop(command_rx: mpsc::Receiver<GuiCommand>, event_tx: mpsc::Sende
                             let tx = event_tx.clone();
                             thread::spawn(move || {
                                 let reader = io::BufReader::new(stderr);
-                                for line in reader.lines() {
-                                    if let Ok(line) = line {
-                                        let _ = tx.send(Event::Log(line));
-                                    }
+                                for line in reader.lines().map_while(Result::ok) {
+                                    let _ = tx.send(Event::Log(line));
                                 }
                             });
                         }
